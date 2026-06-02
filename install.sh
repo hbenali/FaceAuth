@@ -8,28 +8,199 @@ USERNAME=$(whoami)
 USER_ID=$(id -u)
 echo "Installing for user: $USERNAME (UID: $USER_ID)"
 
-# Install dependencies
-echo ""
-echo "Installing dependencies..."
-if command -v dnf &> /dev/null; then
-    sudo dnf install -y python3 python3-pip python3-devel gcc-c++ cmake pam-devel git -q
-    sudo pip install face_recognition opencv-python --break-system-packages --quiet
-elif command -v apt &> /dev/null; then
-    sudo apt update -q
-    sudo apt install -y python3 python3-pip python3-dev build-essential cmake libpam-dev git -q
-    sudo pip install face_recognition opencv-python --break-system-packages --quiet
-elif command -v pacman &> /dev/null; then
-    sudo pacman -S --noconfirm python python-pip cmake base-devel pam git
-    sudo pip install face_recognition opencv-python --break-system-packages --quiet
-else
-    echo "Unsupported distro!"
+# Helper functions
+log() {
+    echo ""
+    echo "==> $1"
+}
+
+warn() {
+    echo "WARN: $1"
+}
+
+die() {
+    echo ""
+    echo "ERROR: $1"
+    echo "FaceAuth install stopped safely before making unsafe changes."
     exit 1
+}
+
+command_exists() {
+    command -v "$1" >/dev/null 2>&1
+}
+
+TOTAL_STEPS=11
+CURRENT_STEP=0
+
+step() {
+    CURRENT_STEP=$((CURRENT_STEP + 1))
+    echo ""
+    echo "[$CURRENT_STEP/$TOTAL_STEPS] $1"
+}
+
+# Install dependencies
+step "Installing system dependencies"
+
+PIP_ARGS=()
+
+install_python_packages() {
+    step "Installing Python face recognition packages"
+
+    if python3 -m pip install --help 2>/dev/null | grep -q -- "--break-system-packages"; then
+        PIP_ARGS+=(--break-system-packages)
+    fi
+
+    # Keep setuptools below 81 because face_recognition_models still depends on pkg_resources.
+    sudo python3 -m pip install --upgrade "pip" "setuptools<81" "wheel" "${PIP_ARGS[@]}" || \
+        warn "Could not prepare pip/setuptools/wheel. Continuing with existing versions."
+
+    echo "Downloading/installing face recognition models from GitHub if not already installed..."
+    echo "This may show as: Cloning face_recognition_models to a temporary /tmp/pip-req-build-* folder."
+
+    if ! sudo python3 -m pip install \
+        "setuptools<81" \
+        face_recognition \
+        git+https://github.com/ageitgey/face_recognition_models \
+        opencv-python \
+        "${PIP_ARGS[@]}"; then
+
+        warn "Full pip install failed. Trying fallback without opencv-python because distro OpenCV may already be installed."
+
+        sudo python3 -m pip install \
+            "setuptools<81" \
+            face_recognition \
+            git+https://github.com/ageitgey/face_recognition_models \
+            "${PIP_ARGS[@]}" || die "Python face recognition packages could not be installed."
+    fi
+}
+
+install_fedora_deps() {
+    echo "Fedora/RHEL-based system detected"
+
+    # Fedora 41+ may use dnf5. Old "dnf groupinstall" can fail there.
+    if ! sudo dnf group install -y "Development Tools" "C Development Tools and Libraries"; then
+        warn "dnf group install failed. Trying older dnf groupinstall syntax."
+
+        sudo dnf groupinstall -y "Development Tools" "C Development Tools and Libraries" || \
+            warn "Development group install failed or is unavailable. Continuing with direct packages."
+    fi
+
+    # Required build/runtime packages. Keep this small; pip handles Python face packages.
+    sudo dnf install -y \
+        python3 python3-pip python3-devel \
+        gcc gcc-c++ make cmake git \
+        pam-devel \
+        python3-opencv \
+        blas-devel lapack-devel \
+        libX11-devel || die "Required Fedora dependencies could not be installed."
+
+    # Optional distro dlib packages. Some Fedora versions do not provide these names.
+    # If unavailable, pip will build/install dlib through face_recognition.
+    sudo dnf install -y --skip-unavailable \
+        dlib dlib-devel python3-dlib || \
+        warn "Fedora dlib packages unavailable. Pip will try to install/build dlib."
+}
+
+
+install_debian_deps() {
+    echo "Debian/Ubuntu-based system detected"
+
+    sudo apt update || die "apt update failed."
+
+    if ! sudo apt install -y \
+        python3 python3-pip python3-dev \
+        build-essential cmake git \
+        libpam0g-dev \
+        libdlib-dev \
+        libopencv-dev python3-opencv \
+        libblas-dev liblapack-dev \
+        libx11-dev; then
+
+        warn "Some Debian/Ubuntu package names were unavailable. Trying smaller fallback package set."
+
+        sudo apt install -y \
+            python3 python3-pip python3-dev \
+            build-essential cmake git \
+            libpam0g-dev \
+            libopencv-dev python3-opencv \
+            libblas-dev liblapack-dev \
+            libx11-dev || die "Required Debian/Ubuntu dependencies could not be installed."
+    fi
+}
+
+install_arch_deps() {
+    echo "Arch-based system detected"
+
+    if ! sudo pacman -S --noconfirm --needed \
+        python python-pip \
+        base-devel cmake git \
+        pam \
+        dlib opencv \
+        blas lapack \
+        libx11; then
+
+        warn "Some Arch packages were unavailable. Trying minimum fallback package set."
+
+        sudo pacman -S --noconfirm --needed \
+            python python-pip \
+            base-devel cmake git \
+            pam \
+            opencv \
+            blas lapack \
+            libx11 || die "Required Arch dependencies could not be installed."
+    fi
+}
+
+if command_exists dnf; then
+    install_fedora_deps
+elif command_exists apt; then
+    install_debian_deps
+elif command_exists pacman; then
+    install_arch_deps
+else
+    die "Unsupported distro. Supported package managers for now: dnf, apt, pacman."
 fi
+
+install_python_packages
+
+step "Checking FaceAuth Python dependencies"
+python3 - <<'PYDEP'
+import sys
+
+checks = [
+    ("pkg_resources", "pkg_resources"),
+    ("cv2", "cv2"),
+    ("dlib", "dlib"),
+    ("face_recognition_models", "face_recognition_models"),
+    ("face_recognition", "face_recognition"),
+]
+
+failed = []
+
+for label, module in checks:
+    try:
+        __import__(module)
+        print(f"OK: {label}")
+    except BaseException as e:
+        print(f"FAILED: {label}: {e}")
+        failed.append(label)
+
+if failed:
+    print("")
+    print("Missing or broken Python modules:", ", ".join(failed))
+    sys.exit(1)
+
+print("All Python dependencies are ready.")
+PYDEP
+
+if [ $? -ne 0 ]; then
+    die "Dependency check failed. Camera, systemd, and PAM were not touched."
+fi
+
 echo "Dependencies ready!"
 
 # Detect desktop environment
-echo ""
-echo "Detecting desktop environment..."
+step "Detecting desktop environment"
 if [ "$XDG_CURRENT_DESKTOP" = "GNOME" ]; then
     DE="gnome"
     echo "GNOME detected"
@@ -41,129 +212,236 @@ else
     echo "Defaulting to GNOME"
 fi
 
-# Detect IR camera - only count cameras with valid frames
-echo ""
-echo "Detecting cameras..."
-IR_INDEX=$(python3 -c "
+# Detect camera - prefer IR-like camera, fallback to RGB
+step "Detecting cameras"
+
+CAMERA_LOG="/tmp/faceauth_camera_detect.log"
+
+CAMERA_INFO=$(python3 - <<'PYCAM' 2>"$CAMERA_LOG"
 import cv2
 import numpy as np
+import sys
 
 valid_cameras = []
+
 for i in range(10):
     cap = cv2.VideoCapture(i)
-    if cap.isOpened():
-        frame = None
-        for _ in range(5):
-            ret, f = cap.read()
-            if ret and f is not None and f.size > 0 and f.mean() > 1:
-                frame = f
-                break
-        if frame is not None:
-            b, g, r = cv2.split(frame)
-            diff = int(np.mean(np.abs(b.astype(int) - r.astype(int))))
-            valid_cameras.append((i, diff))
+
+    if not cap.isOpened():
         cap.release()
+        continue
 
-ir = None
-rgb = None
-for idx, diff in valid_cameras:
-    if diff == 0 and ir is None:
-        ir = idx
-    elif diff > 5 and rgb is None:
-        rgb = idx
+    frame = None
 
-result = ir if ir is not None else (rgb if rgb is not None else 0)
-print(result)
-" 2>/dev/null)
+    for _ in range(8):
+        ret, f = cap.read()
+        if ret and f is not None and f.size > 0 and float(f.mean()) > 1:
+            frame = f
+            break
 
-echo "IR camera detected at index: $IR_INDEX"
+    cap.release()
+
+    if frame is None:
+        continue
+
+    if len(frame.shape) == 2:
+        diff = 0
+        brightness = float(frame.mean())
+    else:
+        b, g, r = cv2.split(frame)
+        diff = int(np.mean(np.abs(b.astype(int) - r.astype(int))))
+        brightness = float(frame.mean())
+
+    valid_cameras.append((i, diff, brightness))
+
+if not valid_cameras:
+    print("NO_CAMERA")
+    sys.exit(2)
+
+selected = None
+kind = "rgb"
+
+# IR/depth cameras often appear grayscale or near-grayscale.
+for idx, diff, brightness in valid_cameras:
+    if diff <= 2:
+        selected = (idx, diff, brightness)
+        kind = "ir-like"
+        break
+
+# Fallback to normal RGB camera.
+if selected is None:
+    selected = valid_cameras[0]
+    kind = "rgb"
+
+idx, diff, brightness = selected
+print(f"{idx}:{kind}:{diff}:{brightness:.2f}")
+PYCAM
+)
+
+CAMERA_STATUS=$?
+
+if [ "$CAMERA_STATUS" -ne 0 ] || [ -z "$CAMERA_INFO" ] || [ "$CAMERA_INFO" = "NO_CAMERA" ]; then
+    echo ""
+    echo "Camera detection log:"
+    if [ -s "$CAMERA_LOG" ]; then
+        cat "$CAMERA_LOG"
+    else
+        echo "No extra camera error output."
+    fi
+    die "No usable camera found. Connect/enable a webcam and run the installer again."
+fi
+
+IR_INDEX=$(echo "$CAMERA_INFO" | cut -d':' -f1)
+CAMERA_KIND=$(echo "$CAMERA_INFO" | cut -d':' -f2)
+CAMERA_DIFF=$(echo "$CAMERA_INFO" | cut -d':' -f3)
+CAMERA_BRIGHTNESS=$(echo "$CAMERA_INFO" | cut -d':' -f4)
+
+if ! [[ "$IR_INDEX" =~ ^[0-9]+$ ]]; then
+    die "Camera detection returned an invalid camera index: $IR_INDEX"
+fi
+
+echo "Selected $CAMERA_KIND camera at index: $IR_INDEX"
+echo "Camera color-diff: $CAMERA_DIFF, brightness: $CAMERA_BRIGHTNESS"
 
 # Create faceauth directory
-mkdir -p /home/$USERNAME/.faceauth
+FACEAUTH_HOME="/home/$USERNAME/.faceauth"
+mkdir -p "$FACEAUTH_HOME"
+chmod 700 "$FACEAUTH_HOME"
 
 # Save config
-python3 -c "
+export FACEAUTH_HOME IR_INDEX DE
+python3 - <<'PYCFG'
 import json
+import os
+
 config = {
-    'ir_camera': $IR_INDEX,
-    'rgb_camera': 0,
-    'tolerance': 0.6,
-    'max_attempts': 50,
-    'desktop': '$DE'
+    "ir_camera": int(os.environ["IR_INDEX"]),
+    "rgb_camera": 0,
+    "tolerance": 0.6,
+    "max_attempts": 50,
+    "desktop": os.environ["DE"],
 }
-with open('/home/$USERNAME/.faceauth/config.json', 'w') as f:
-    json.dump(config, f)
-print('Config saved!')
-"
+
+config_path = os.path.join(os.environ["FACEAUTH_HOME"], "config.json")
+
+with open(config_path, "w") as f:
+    json.dump(config, f, indent=2)
+
+print("Config saved!")
+PYCFG
 
 # Capture face
-echo ""
+step "Capturing registered face"
 echo "========================================"
 echo "FACE REGISTRATION"
-echo "Look at the camera!"
+echo "Look directly at the selected camera."
 echo "Capturing in 3 seconds..."
 echo "========================================"
 
-python3 -c "
-import cv2, time, sys
-import numpy as np
+CAPTURE_LOG="/tmp/faceauth_capture.log"
+FACE_IMAGE="$FACEAUTH_HOME/my_face.jpg"
 
-ir_index = $IR_INDEX
-cap = cv2.VideoCapture(ir_index)
+export IR_INDEX FACE_IMAGE
+
+python3 - <<'PYCAP' 2>"$CAPTURE_LOG"
+import cv2
+import os
+import sys
+import time
+
+camera_index = int(os.environ["IR_INDEX"])
+face_image = os.environ["FACE_IMAGE"]
+
+cap = cv2.VideoCapture(camera_index)
 
 if not cap.isOpened():
-    print('IR camera failed! Trying index 0...')
-    cap = cv2.VideoCapture(0)
+    print(f"Selected camera index {camera_index} failed to open.", file=sys.stderr)
+    sys.exit(1)
 
-# Warmup camera
 time.sleep(3)
+
 for _ in range(15):
     cap.read()
 
-# Capture valid frame
 frame = None
-for _ in range(10):
+
+for _ in range(20):
     ret, f = cap.read()
-    if ret and f is not None and f.size > 0 and f.mean() > 1:
+    if ret and f is not None and f.size > 0 and float(f.mean()) > 1:
         frame = f
         break
+    time.sleep(0.1)
 
 cap.release()
 
-if frame is not None:
-    cv2.imwrite('/home/$USERNAME/.faceauth/my_face.jpg', frame)
-    print('Face captured!')
-else:
-    print('Capture failed!')
+if frame is None:
+    print("Could not capture a valid camera frame.", file=sys.stderr)
     sys.exit(1)
-" 2>/dev/null
 
-if [ $? -ne 0 ]; then
-    echo "Face capture failed! Run installer again."
-    exit 1
+if not cv2.imwrite(face_image, frame):
+    print(f"Failed to write face image to {face_image}", file=sys.stderr)
+    sys.exit(1)
+
+print("Face image captured.")
+PYCAP
+
+if [ $? -ne 0 ] || [ ! -s "$FACE_IMAGE" ]; then
+    echo ""
+    echo "Face capture log:"
+    if [ -s "$CAPTURE_LOG" ]; then
+        cat "$CAPTURE_LOG"
+    else
+        echo "No extra capture error output."
+    fi
+    die "Face capture failed. Systemd and PAM were not touched."
 fi
 
+chmod 600 "$FACE_IMAGE"
+echo "Face image saved: $FACE_IMAGE"
+
 # Verify face
-echo "Verifying face..."
-python3 -c "
-import face_recognition, sys
-image = face_recognition.load_image_file('/home/$USERNAME/.faceauth/my_face.jpg')
-encodings = face_recognition.face_encodings(image)
-if encodings:
-    print('Face verified!')
-else:
-    print('No face detected! Try better lighting.')
+step "Verifying registered face"
+
+VERIFY_LOG="/tmp/faceauth_verify.log"
+export FACE_IMAGE
+
+python3 - <<'PYVERIFY' 2>"$VERIFY_LOG"
+import os
+import sys
+import face_recognition
+
+face_image = os.environ["FACE_IMAGE"]
+
+try:
+    image = face_recognition.load_image_file(face_image)
+    encodings = face_recognition.face_encodings(image)
+except Exception as e:
+    print(f"Face verification error: {e}", file=sys.stderr)
     sys.exit(1)
-"
+
+if not encodings:
+    print("No face encoding was created from the captured image.", file=sys.stderr)
+    sys.exit(2)
+
+if len(encodings) > 1:
+    print(f"WARNING: {len(encodings)} faces detected. Using the first face only.")
+
+print(f"Face verified. Encodings found: {len(encodings)}")
+PYVERIFY
 
 if [ $? -ne 0 ]; then
-    echo "Face verification failed! Run installer again in better lighting."
-    exit 1
+    echo ""
+    echo "Face verification log:"
+    if [ -s "$VERIFY_LOG" ]; then
+        cat "$VERIFY_LOG"
+    else
+        echo "No extra verification error output."
+    fi
+    die "Face verification failed. Try better lighting and make sure only your face is visible."
 fi
 
 # Write daemon
-echo ""
-echo "Installing FaceAuth daemon..."
+step "Installing FaceAuth daemon"
 sudo tee /usr/local/bin/faceauth_daemon > /dev/null << 'DAEMON_EOF'
 #!/usr/bin/env python3
 import face_recognition
@@ -176,7 +454,16 @@ import sys
 import subprocess
 import threading
 
-TOKEN_FILE = "/tmp/faceauth_token"
+def get_token_file():
+    runtime_dir = os.environ.get("XDG_RUNTIME_DIR")
+
+    if runtime_dir:
+        token_dir = os.path.join(runtime_dir, "faceauth")
+    else:
+        token_dir = f"/run/user/{os.getuid()}/faceauth"
+
+    os.makedirs(token_dir, mode=0o700, exist_ok=True)
+    return os.path.join(token_dir, "token")
 
 def load_config(username):
     config_path = f"/home/{username}/.faceauth/config.json"
@@ -196,9 +483,14 @@ def load_config(username):
     return ir_index, tolerance, encodings[0]
 
 def write_token(username):
-    with open(TOKEN_FILE, "w") as f:
+    token_file = get_token_file()
+
+    fd = os.open(token_file, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+
+    with os.fdopen(fd, "w") as f:
         f.write(f"{username}:{time.time()}")
-    os.chmod(TOKEN_FILE, 0o666)
+
+    os.chmod(token_file, 0o600)
 
 def unlock_screen():
     try:
@@ -313,23 +605,45 @@ sudo sed -i "s/FACEAUTH_USER/$USERNAME/g" /usr/local/bin/faceauth_daemon
 sudo tee /usr/local/bin/faceauth > /dev/null << 'PAM_EOF'
 #!/usr/bin/env python3
 import os
+import pwd
 import sys
 import time
 
-TOKEN_FILE = "/tmp/faceauth_token"
 TOKEN_VALIDITY = 10
+
+def get_user_uid(username):
+    return pwd.getpwnam(username).pw_uid
+
+def get_token_file(username):
+    uid = get_user_uid(username)
+    return os.path.join("/run/user", str(uid), "faceauth", "token")
 
 def check_token(username):
     try:
-        if not os.path.exists(TOKEN_FILE):
+        if not username:
             return False
-        with open(TOKEN_FILE, "r") as f:
+
+        expected_uid = get_user_uid(username)
+        token_file = get_token_file(username)
+
+        if not os.path.exists(token_file):
+            return False
+
+        st = os.stat(token_file)
+
+        if st.st_uid != expected_uid:
+            return False
+
+        if st.st_mode & 0o077:
+            return False
+
+        with open(token_file, "r") as f:
             content = f.read().strip()
         token_user, timestamp = content.split(":")
         timestamp = float(timestamp)
         age = time.time() - timestamp
         if token_user == username and age < TOKEN_VALIDITY:
-            os.remove(TOKEN_FILE)
+            os.remove(token_file)
             return True
         return False
     except:
@@ -344,8 +658,7 @@ PAM_EOF
 sudo chmod +x /usr/local/bin/faceauth
 
 # Install systemd service
-echo ""
-echo "Installing systemd service..."
+step "Installing systemd service"
 sudo tee /etc/systemd/system/faceauth.service > /dev/null << EOF
 [Unit]
 Description=FaceAuth Face Recognition Daemon
@@ -357,36 +670,98 @@ Type=simple
 User=$USERNAME
 Environment=DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/$USER_ID/bus
 Environment=XDG_RUNTIME_DIR=/run/user/$USER_ID
+Environment=PYTHONUNBUFFERED=1
 ExecStartPre=/bin/bash -c 'until [ -S /run/user/$USER_ID/bus ]; do sleep 0.5; done; sleep 5'
-ExecStart=/usr/bin/python3 /usr/local/bin/faceauth_daemon $USERNAME
-Restart=always
+ExecStart=/usr/bin/python3 -u /usr/local/bin/faceauth_daemon $USERNAME
+Restart=on-failure
 RestartSec=3
+StandardOutput=journal
+StandardError=journal
 
 [Install]
 WantedBy=graphical.target
 EOF
 
-sudo systemctl daemon-reload
-sudo systemctl enable faceauth
-sudo systemctl restart faceauth
-
 # Setup PAM
-echo ""
-echo "Setting up PAM..."
+step "Setting up PAM"
+
+PAM_FILE=""
+PAM_CHANGED=0
+
 if [ "$DE" = "gnome" ]; then
-    if [ ! -f /etc/pam.d/gdm-password.backup ]; then
-        sudo cp /etc/pam.d/gdm-password /etc/pam.d/gdm-password.backup
+    PAM_FILE="/etc/pam.d/gdm-password"
+else
+    warn "Automatic PAM setup currently supports GNOME/GDM only."
+    warn "Skipping PAM modification for this desktop environment."
+fi
+
+if [ -n "$PAM_FILE" ]; then
+    if [ ! -f "$PAM_FILE" ]; then
+        die "PAM file not found: $PAM_FILE"
     fi
-    if ! grep -q "faceauth" /etc/pam.d/gdm-password; then
-        sudo sed -i '1s/^/auth sufficient pam_exec.so quiet \/usr\/local\/bin\/faceauth\n/' /etc/pam.d/gdm-password
-        echo "PAM configured!"
+
+    PAM_BACKUP="${PAM_FILE}.faceauth-backup-$(date +%Y%m%d-%H%M%S)"
+    sudo cp "$PAM_FILE" "$PAM_BACKUP"
+    echo "PAM backup created: $PAM_BACKUP"
+
+    PAM_LINE="auth sufficient pam_exec.so quiet /usr/local/bin/faceauth"
+
+    if sudo grep -Fxq "$PAM_LINE" "$PAM_FILE"; then
+        echo "PAM already configured."
     else
-        echo "PAM already configured!"
+        sudo sed -i "1i$PAM_LINE" "$PAM_FILE"
+
+        if sudo grep -Fxq "$PAM_LINE" "$PAM_FILE"; then
+            PAM_CHANGED=1
+            echo "PAM configured successfully."
+        else
+            sudo cp "$PAM_BACKUP" "$PAM_FILE"
+            die "PAM modification failed. Backup restored."
+        fi
     fi
+fi
+
+# Enable and start service only after PAM setup has succeeded/skipped safely
+step "Starting FaceAuth service"
+
+if ! sudo systemctl daemon-reload; then
+    if [ "$PAM_CHANGED" = "1" ] && [ -n "$PAM_BACKUP" ]; then
+        sudo cp "$PAM_BACKUP" "$PAM_FILE"
+    fi
+    die "systemd daemon-reload failed."
+fi
+
+if ! sudo systemctl enable faceauth; then
+    if [ "$PAM_CHANGED" = "1" ] && [ -n "$PAM_BACKUP" ]; then
+        sudo cp "$PAM_BACKUP" "$PAM_FILE"
+    fi
+    die "Could not enable FaceAuth systemd service."
+fi
+
+if ! sudo systemctl restart faceauth; then
+    if [ "$PAM_CHANGED" = "1" ] && [ -n "$PAM_BACKUP" ]; then
+        sudo cp "$PAM_BACKUP" "$PAM_FILE"
+    fi
+    die "Could not start FaceAuth systemd service. PAM backup restored if FaceAuth changed it."
+fi
+
+sleep 2
+
+if sudo systemctl is-active --quiet faceauth; then
+    echo "FaceAuth service is active."
+else
+    warn "FaceAuth service is not active yet."
+    warn "Check logs with: journalctl -u faceauth -e --no-pager"
 fi
 
 echo ""
 echo "========================================"
 echo "FaceAuth installed successfully!"
-echo "Reboot and lock screen to test!"
+echo "FaceAuth service is started now."
+echo "Lock your screen to test face unlock."
+echo ""
+echo "If it does not work immediately:"
+echo "  1. Check logs: journalctl -u faceauth -e --no-pager"
+echo "  2. Log out and log back in"
+echo "  3. Reboot only as a last fallback"
 echo "========================================"
