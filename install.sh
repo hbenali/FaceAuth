@@ -50,6 +50,10 @@ install_python_packages() {
         PIP_ARGS+=(--break-system-packages)
     fi
 
+    if python3 -m pip install --help 2>/dev/null | grep -q -- "--root-user-action"; then
+        PIP_ARGS+=(--root-user-action=ignore)
+    fi
+
     # Keep setuptools below 81 because face_recognition_models still depends on pkg_resources.
     sudo python3 -m pip install --upgrade "pip" "setuptools<81" "wheel" "${PIP_ARGS[@]}" || \
         warn "Could not prepare pip/setuptools/wheel. Continuing with existing versions."
@@ -166,6 +170,13 @@ install_python_packages
 step "Checking FaceAuth Python dependencies"
 python3 - <<'PYDEP'
 import sys
+import warnings
+
+warnings.filterwarnings(
+    "ignore",
+    message="pkg_resources is deprecated as an API.*",
+    category=UserWarning,
+)
 
 checks = [
     ("pkg_resources", "pkg_resources"),
@@ -444,6 +455,14 @@ fi
 step "Installing FaceAuth daemon"
 sudo tee /usr/local/bin/faceauth_daemon > /dev/null << 'DAEMON_EOF'
 #!/usr/bin/env python3
+import warnings
+
+warnings.filterwarnings(
+    "ignore",
+    message="pkg_resources is deprecated as an API.*",
+    category=UserWarning,
+)
+
 import face_recognition
 import cv2
 import os
@@ -726,6 +745,14 @@ import platform
 import pwd
 import subprocess
 import sys
+import time
+import warnings
+
+warnings.filterwarnings(
+    "ignore",
+    message="pkg_resources is deprecated as an API.*",
+    category=UserWarning,
+)
 from pathlib import Path
 from contextlib import contextmanager
 
@@ -937,6 +964,225 @@ def cmd_doctor():
     print("")
     cmd_list_cameras()
 
+def get_config_path(username):
+    return user_home(username) / ".faceauth" / "config.json"
+
+def get_face_path(username):
+    return user_home(username) / ".faceauth" / "my_face.jpg"
+
+def load_config(username):
+    cfg = get_config_path(username)
+
+    data = {
+        "ir_camera": 0,
+        "rgb_camera": 0,
+        "tolerance": 0.6,
+        "max_attempts": 50,
+        "desktop": os.environ.get("XDG_CURRENT_DESKTOP", "unknown").lower(),
+    }
+
+    if cfg.exists():
+        try:
+            data.update(json.loads(cfg.read_text()))
+        except Exception as e:
+            print(f"Config read warning: {e}")
+
+    return data
+
+def save_config(username, data):
+    cfg = get_config_path(username)
+    cfg.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    cfg.write_text(json.dumps(data, indent=2))
+    cfg.chmod(0o600)
+
+def restart_service():
+    print("Restarting FaceAuth service...")
+    code, out, err = run(["sudo", "systemctl", "restart", "faceauth"])
+
+    if code == 0:
+        print("FaceAuth service restarted.")
+        return 0
+
+    print(f"Could not restart service: {err or out}")
+    print("Run manually: sudo systemctl restart faceauth")
+    return 1
+
+def analyze_frame(frame):
+    import cv2
+    import numpy as np
+
+    if len(frame.shape) == 2:
+        diff = 0
+        brightness = float(frame.mean())
+    else:
+        b, g, r = cv2.split(frame)
+        diff = int(np.mean(np.abs(b.astype(int) - r.astype(int))))
+        brightness = float(frame.mean())
+
+    kind = "ir-like" if diff <= 2 else "rgb"
+    return kind, diff, brightness
+
+def capture_frame(camera_index, warmup=10, attempts=30):
+    import cv2
+
+    with suppress_native_stderr():
+        cap = cv2.VideoCapture(camera_index)
+
+    if not cap.isOpened():
+        with suppress_native_stderr():
+            cap.release()
+        return None, f"Camera {camera_index} could not be opened."
+
+    for _ in range(warmup):
+        with suppress_native_stderr():
+            cap.read()
+
+    frame = None
+
+    for _ in range(attempts):
+        with suppress_native_stderr():
+            ret, f = cap.read()
+
+        if ret and f is not None and f.size > 0 and float(f.mean()) > 1:
+            frame = f
+            break
+
+        time.sleep(0.1)
+
+    with suppress_native_stderr():
+        cap.release()
+
+    if frame is None:
+        return None, f"Camera {camera_index} opened but did not return a usable frame."
+
+    return frame, None
+
+def cmd_test_camera():
+    username = current_user()
+    cfg = load_config(username)
+
+    if len(sys.argv) >= 3:
+        try:
+            camera_index = int(sys.argv[2])
+        except ValueError:
+            print("Camera index must be a number.")
+            return 1
+    else:
+        camera_index = int(cfg.get("ir_camera", 0))
+
+    header("FaceAuth Camera Test")
+    print(f"Testing camera index: {camera_index}")
+
+    frame, err = capture_frame(camera_index)
+
+    if err:
+        print(f"FAILED: {err}")
+        return 1
+
+    kind, diff, brightness = analyze_frame(frame)
+    print(f"OK: Camera {camera_index}")
+    print(f"Type: {kind}")
+    print(f"Color diff: {diff}")
+    print(f"Brightness: {brightness:.2f}")
+    return 0
+
+def cmd_set_camera():
+    if len(sys.argv) < 3:
+        print("Usage: faceauthctl set-camera <index>")
+        return 1
+
+    try:
+        camera_index = int(sys.argv[2])
+    except ValueError:
+        print("Camera index must be a number.")
+        return 1
+
+    username = current_user()
+
+    header("FaceAuth Set Camera")
+    print(f"Checking camera {camera_index} before saving...")
+
+    frame, err = capture_frame(camera_index)
+
+    if err:
+        print(f"FAILED: {err}")
+        return 1
+
+    kind, diff, brightness = analyze_frame(frame)
+
+    cfg = load_config(username)
+    cfg["ir_camera"] = camera_index
+    save_config(username, cfg)
+
+    print(f"Saved camera index: {camera_index}")
+    print(f"Type: {kind}")
+    print(f"Color diff: {diff}")
+    print(f"Brightness: {brightness:.2f}")
+
+    restart_service()
+    return 0
+
+def cmd_enroll():
+    import cv2
+    import face_recognition
+
+    username = current_user()
+    cfg = load_config(username)
+
+    if len(sys.argv) >= 3:
+        try:
+            camera_index = int(sys.argv[2])
+        except ValueError:
+            print("Camera index must be a number.")
+            return 1
+    else:
+        camera_index = int(cfg.get("ir_camera", 0))
+
+    face_path = get_face_path(username)
+
+    header("FaceAuth Enrollment")
+    print(f"Using camera index: {camera_index}")
+    print("Look directly at the camera.")
+    print("Capturing in 3 seconds...")
+    time.sleep(3)
+
+    frame, err = capture_frame(camera_index)
+
+    if err:
+        print(f"FAILED: {err}")
+        return 1
+
+    face_path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+
+    if not cv2.imwrite(str(face_path), frame):
+        print(f"FAILED: Could not save face image to {face_path}")
+        return 1
+
+    face_path.chmod(0o600)
+
+    try:
+        image = face_recognition.load_image_file(str(face_path))
+        encodings = face_recognition.face_encodings(image)
+    except Exception as e:
+        print(f"FAILED: Face verification error: {e}")
+        return 1
+
+    if not encodings:
+        print("FAILED: No face detected. Try better lighting and keep only your face visible.")
+        return 1
+
+    if len(encodings) > 1:
+        print(f"WARNING: {len(encodings)} faces detected. FaceAuth will use the first face.")
+
+    cfg["ir_camera"] = camera_index
+    save_config(username, cfg)
+
+    print(f"Face enrolled successfully: {face_path}")
+    print(f"Encodings found: {len(encodings)}")
+
+    restart_service()
+    return 0
+
 def usage():
     print("FaceAuth control tool")
     print("")
@@ -945,10 +1191,15 @@ def usage():
     print("  faceauthctl logs [since]")
     print("  faceauthctl doctor")
     print("  faceauthctl list-cameras")
+    print("  faceauthctl test-camera [index]")
+    print("  faceauthctl set-camera <index>")
+    print("  faceauthctl enroll [index]")
     print("")
     print("Examples:")
     print("  faceauthctl logs '10 minutes ago'")
-    print("  faceauthctl doctor")
+    print("  faceauthctl test-camera 1")
+    print("  faceauthctl set-camera 2")
+    print("  faceauthctl enroll 2")
 
 def main():
     if len(sys.argv) < 2:
@@ -965,6 +1216,12 @@ def main():
         cmd_doctor()
     elif cmd in ("list-cameras", "cameras"):
         cmd_list_cameras()
+    elif cmd == "test-camera":
+        return cmd_test_camera()
+    elif cmd == "set-camera":
+        return cmd_set_camera()
+    elif cmd == "enroll":
+        return cmd_enroll()
     elif cmd in ("help", "-h", "--help"):
         usage()
     else:
