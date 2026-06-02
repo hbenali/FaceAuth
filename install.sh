@@ -453,6 +453,24 @@ import signal
 import sys
 import subprocess
 import threading
+from contextlib import contextmanager
+
+@contextmanager
+def suppress_native_stderr():
+    """
+    Suppress noisy native OpenCV/V4L stderr messages during camera open/read/release.
+    FaceAuth still prints its own useful status logs.
+    """
+    devnull_fd = os.open(os.devnull, os.O_WRONLY)
+    old_stderr_fd = os.dup(2)
+
+    try:
+        os.dup2(devnull_fd, 2)
+        yield
+    finally:
+        os.dup2(old_stderr_fd, 2)
+        os.close(old_stderr_fd)
+        os.close(devnull_fd)
 
 def get_token_file():
     runtime_dir = os.environ.get("XDG_RUNTIME_DIR")
@@ -507,16 +525,40 @@ def unlock_screen():
         print(f"Unlock error: {e}")
 
 def face_recognition_loop(username, ir_index, tolerance, my_encoding, stop_event):
-    print("Camera activated - looking for face")
-    video = cv2.VideoCapture(ir_index)
+    print(f"Camera activated - looking for face on index {ir_index}")
+
+    video = None
+
+    with suppress_native_stderr():
+        video = cv2.VideoCapture(ir_index)
+
+    if not video or not video.isOpened():
+        print(f"Camera open failed for index {ir_index}")
+        return
+
     for _ in range(10):
-        video.read()
+        if stop_event.is_set():
+            with suppress_native_stderr():
+                video.release()
+            print("Camera deactivated")
+            return
+
+        with suppress_native_stderr():
+            video.read()
+
     match_count = 0
+
     while not stop_event.is_set():
-        ret, frame = video.read()
-        if not ret:
+        with suppress_native_stderr():
+            ret, frame = video.read()
+
+        if stop_event.is_set():
+            break
+
+        if not ret or frame is None:
             time.sleep(0.1)
             continue
+
         rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
         face_locations = face_recognition.face_locations(rgb_frame)
         face_encodings = face_recognition.face_encodings(rgb_frame, face_locations)
@@ -532,7 +574,8 @@ def face_recognition_loop(username, ir_index, tolerance, my_encoding, stop_event
             else:
                 match_count = max(0, match_count - 1)
         time.sleep(0.1)
-    video.release()
+    with suppress_native_stderr():
+        video.release()
     print("Camera deactivated")
 
 def run_daemon(username):
@@ -555,6 +598,8 @@ def run_daemon(username):
     def handle_exit(sig, frame):
         if stop_event:
             stop_event.set()
+        if face_thread and face_thread.is_alive():
+            face_thread.join(timeout=2)
         proc.terminate()
         sys.exit(0)
 
@@ -569,29 +614,42 @@ def run_daemon(username):
 
         elif "'IdleHint': <false>" in line and is_locked_state:
             elapsed = time.time() - lock_time if lock_time else 0
+
+            if stop_event is not None:
+                continue
+
             print(f"Wake signal after {elapsed:.1f}s")
+
             if elapsed < 1:
                 print("Quick wake - just screen dim, ignoring")
                 is_locked_state = False
                 lock_time = None
             else:
-                if stop_event is None:
-                    print("Real lockscreen - starting camera!")
-                    stop_event = threading.Event()
-                    face_thread = threading.Thread(
-                        target=face_recognition_loop,
-                        args=(username, ir_index, tolerance, my_encoding, stop_event)
-                    )
-                    face_thread.daemon = True
-                    face_thread.start()
+                print("Real lockscreen - starting camera!")
+                stop_event = threading.Event()
+                face_thread = threading.Thread(
+                    target=face_recognition_loop,
+                    args=(username, ir_index, tolerance, my_encoding, stop_event)
+                )
+                face_thread.daemon = True
+                face_thread.start()
 
         elif "'LockedHint': <false>" in line or "Session.Unlock" in line:
+            if not is_locked_state and stop_event is None:
+                continue
+
             print("Screen UNLOCKED - stopping camera")
             is_locked_state = False
             lock_time = None
+
             if stop_event:
                 stop_event.set()
+
+                if face_thread and face_thread.is_alive():
+                    face_thread.join(timeout=2)
+
                 stop_event = None
+                face_thread = None
 
 if __name__ == "__main__":
     username = sys.argv[1] if len(sys.argv) > 1 else "FACEAUTH_USER"
