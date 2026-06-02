@@ -38,6 +38,73 @@ step() {
     echo "[$CURRENT_STEP/$TOTAL_STEPS] $1"
 }
 
+RUN_LOG_DIR="/tmp/faceauth-install-$(date +%Y%m%d-%H%M%S)"
+mkdir -p "$RUN_LOG_DIR"
+
+note() {
+    echo "NOTE: $1"
+}
+
+run_capture() {
+    local label="$1"
+    shift
+
+    local safe_label
+    safe_label=$(echo "$label" | tr -c 'A-Za-z0-9_.-' '_')
+    local logfile="$RUN_LOG_DIR/${safe_label}.log"
+
+    if [ "${FACEAUTH_VERBOSE:-0}" = "1" ]; then
+        "$@"
+    else
+        "$@" >"$logfile" 2>&1
+    fi
+
+    return $?
+}
+
+run_required() {
+    local label="$1"
+    shift
+
+    local safe_label
+    safe_label=$(echo "$label" | tr -c 'A-Za-z0-9_.-' '_')
+    local logfile="$RUN_LOG_DIR/${safe_label}.log"
+
+    if run_capture "$label" "$@"; then
+        return 0
+    fi
+
+    echo ""
+    echo "Command failed: $*"
+    echo "Log file: $logfile"
+
+    if [ -s "$logfile" ]; then
+        echo ""
+        echo "Last lines from log:"
+        tail -80 "$logfile"
+    fi
+
+    return 1
+}
+
+run_optional() {
+    local label="$1"
+    local message="$2"
+    shift 2
+
+    local safe_label
+    safe_label=$(echo "$label" | tr -c 'A-Za-z0-9_.-' '_')
+    local logfile="$RUN_LOG_DIR/${safe_label}.log"
+
+    if run_capture "$label" "$@"; then
+        return 0
+    fi
+
+    note "$message"
+    note "Details saved to: $logfile"
+    return 0
+}
+
 # Install dependencies
 step "Installing system dependencies"
 
@@ -45,6 +112,8 @@ PIP_ARGS=()
 
 install_python_packages() {
     step "Installing Python face recognition packages"
+
+    PIP_ARGS=()
 
     if python3 -m pip install --help 2>/dev/null | grep -q -- "--break-system-packages"; then
         PIP_ARGS+=(--break-system-packages)
@@ -54,106 +123,112 @@ install_python_packages() {
         PIP_ARGS+=(--root-user-action=ignore)
     fi
 
-    # Keep setuptools below 81 because face_recognition_models still depends on pkg_resources.
-    sudo python3 -m pip install --upgrade "pip" "setuptools<81" "wheel" "${PIP_ARGS[@]}" || \
-        warn "Could not prepare pip/setuptools/wheel. Continuing with existing versions."
+    note "Preparing Python packaging tools"
+    run_optional \
+        "pip-tools" \
+        "Could not upgrade pip/setuptools/wheel. Continuing with existing versions." \
+        sudo python3 -m pip install --upgrade "pip" "setuptools<81" "wheel" "${PIP_ARGS[@]}"
 
-    echo "Downloading/installing face recognition models from GitHub if not already installed..."
-    echo "This may show as: Cloning face_recognition_models to a temporary /tmp/pip-req-build-* folder."
+    note "Installing FaceAuth Python packages"
+    note "Full pip logs are saved in: $RUN_LOG_DIR"
 
-    if ! sudo python3 -m pip install \
-        "setuptools<81" \
-        face_recognition \
-        git+https://github.com/ageitgey/face_recognition_models \
-        opencv-python \
-        "${PIP_ARGS[@]}"; then
-
-        warn "Full pip install failed. Trying fallback without opencv-python because distro OpenCV may already be installed."
-
+    if ! run_capture "pip-faceauth-full" \
         sudo python3 -m pip install \
             "setuptools<81" \
             face_recognition \
             git+https://github.com/ageitgey/face_recognition_models \
-            "${PIP_ARGS[@]}" || die "Python face recognition packages could not be installed."
+            opencv-python \
+            "${PIP_ARGS[@]}"; then
+
+        note "Full pip install failed. Trying fallback without opencv-python because distro OpenCV may already be installed."
+
+        run_required \
+            "pip-faceauth-fallback" \
+            sudo python3 -m pip install \
+                "setuptools<81" \
+                face_recognition \
+                git+https://github.com/ageitgey/face_recognition_models \
+                "${PIP_ARGS[@]}" || die "Python face recognition packages could not be installed."
     fi
 }
 
+
 install_fedora_deps() {
     echo "Fedora/RHEL-based system detected"
+    note "Using direct package install. Skipping optional development groups to avoid dnf/dnf5 group-name differences."
 
-    # Fedora 41+ may use dnf5. Old "dnf groupinstall" can fail there.
-    if ! sudo dnf group install -y "Development Tools" "C Development Tools and Libraries"; then
-        warn "dnf group install failed. Trying older dnf groupinstall syntax."
+    run_required \
+        "dnf-required" \
+        sudo dnf install -y \
+            python3 python3-pip python3-devel \
+            gcc gcc-c++ make cmake git \
+            pam-devel \
+            python3-opencv \
+            blas-devel lapack-devel \
+            libX11-devel || die "Required Fedora dependencies could not be installed."
 
-        sudo dnf groupinstall -y "Development Tools" "C Development Tools and Libraries" || \
-            warn "Development group install failed or is unavailable. Continuing with direct packages."
-    fi
-
-    # Required build/runtime packages. Keep this small; pip handles Python face packages.
-    sudo dnf install -y \
-        python3 python3-pip python3-devel \
-        gcc gcc-c++ make cmake git \
-        pam-devel \
-        python3-opencv \
-        blas-devel lapack-devel \
-        libX11-devel || die "Required Fedora dependencies could not be installed."
-
-    # Optional distro dlib packages. Some Fedora versions do not provide these names.
-    # If unavailable, pip will build/install dlib through face_recognition.
-    sudo dnf install -y --skip-unavailable \
-        dlib dlib-devel python3-dlib || \
-        warn "Fedora dlib packages unavailable. Pip will try to install/build dlib."
+    note "Skipping optional Fedora dlib RPM packages. Pip/face_recognition will provide dlib if needed."
 }
 
 
 install_debian_deps() {
     echo "Debian/Ubuntu-based system detected"
 
-    sudo apt update || die "apt update failed."
+    run_required "apt-update" sudo apt update || die "apt update failed."
 
-    if ! sudo apt install -y \
-        python3 python3-pip python3-dev \
-        build-essential cmake git \
-        libpam0g-dev \
-        libdlib-dev \
-        libopencv-dev python3-opencv \
-        libblas-dev liblapack-dev \
-        libx11-dev; then
-
-        warn "Some Debian/Ubuntu package names were unavailable. Trying smaller fallback package set."
-
+    if ! run_capture \
+        "apt-full" \
         sudo apt install -y \
             python3 python3-pip python3-dev \
             build-essential cmake git \
             libpam0g-dev \
+            libdlib-dev \
             libopencv-dev python3-opencv \
             libblas-dev liblapack-dev \
-            libx11-dev || die "Required Debian/Ubuntu dependencies could not be installed."
+            libx11-dev; then
+
+        note "Some Debian/Ubuntu package names were unavailable. Trying smaller fallback package set."
+
+        run_required \
+            "apt-fallback" \
+            sudo apt install -y \
+                python3 python3-pip python3-dev \
+                build-essential cmake git \
+                libpam0g-dev \
+                python3-opencv \
+                libblas-dev liblapack-dev \
+                libx11-dev || die "Required Debian/Ubuntu dependencies could not be installed."
     fi
 }
+
 
 install_arch_deps() {
     echo "Arch-based system detected"
 
-    if ! sudo pacman -S --noconfirm --needed \
-        python python-pip \
-        base-devel cmake git \
-        pam \
-        dlib opencv \
-        blas lapack \
-        libx11; then
-
-        warn "Some Arch packages were unavailable. Trying minimum fallback package set."
-
+    if ! run_capture \
+        "pacman-full" \
         sudo pacman -S --noconfirm --needed \
             python python-pip \
             base-devel cmake git \
             pam \
-            opencv \
+            dlib opencv \
             blas lapack \
-            libx11 || die "Required Arch dependencies could not be installed."
+            libx11; then
+
+        note "Some Arch packages were unavailable. Trying minimum fallback package set."
+
+        run_required \
+            "pacman-fallback" \
+            sudo pacman -S --noconfirm --needed \
+                python python-pip \
+                base-devel cmake git \
+                pam \
+                opencv \
+                blas lapack \
+                libx11 || die "Required Arch dependencies could not be installed."
     fi
 }
+
 
 if command_exists dnf; then
     install_fedora_deps
@@ -179,11 +254,11 @@ warnings.filterwarnings(
 )
 
 checks = [
-    ("pkg_resources", "pkg_resources"),
-    ("cv2", "cv2"),
+    ("setuptools compatibility", "pkg_resources"),
+    ("OpenCV", "cv2"),
     ("dlib", "dlib"),
-    ("face_recognition_models", "face_recognition_models"),
-    ("face_recognition", "face_recognition"),
+    ("face recognition models", "face_recognition_models"),
+    ("face recognition", "face_recognition"),
 ]
 
 failed = []
@@ -949,8 +1024,16 @@ def cmd_doctor():
 
     print("")
     print("Python imports:")
-    for m in ["pkg_resources", "cv2", "dlib", "face_recognition_models", "face_recognition"]:
-        print(f"  {m}: {import_check(m)}")
+    checks = [
+        ("setuptools compatibility", "pkg_resources"),
+        ("OpenCV", "cv2"),
+        ("dlib", "dlib"),
+        ("face recognition models", "face_recognition_models"),
+        ("face recognition", "face_recognition"),
+    ]
+
+    for label, module in checks:
+        print(f"  {label}: {import_check(module)}")
 
     print("")
     print("PAM:")
@@ -1338,6 +1421,7 @@ echo ""
 echo "========================================"
 echo "FaceAuth installed successfully!"
 echo "FaceAuth service is started now."
+echo "Installer logs saved at: $RUN_LOG_DIR"
 echo "Lock your screen to test face unlock."
 echo ""
 echo "If it does not work immediately:"
