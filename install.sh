@@ -29,7 +29,7 @@ command_exists() {
     command -v "$1" >/dev/null 2>&1
 }
 
-TOTAL_STEPS=11
+TOTAL_STEPS=12
 CURRENT_STEP=0
 
 step() {
@@ -714,6 +714,271 @@ if __name__ == "__main__":
 PAM_EOF
 
 sudo chmod +x /usr/local/bin/faceauth
+
+# Install FaceAuth control tool
+step "Installing FaceAuth control tool"
+
+sudo tee /usr/local/bin/faceauthctl > /dev/null << 'CTL_EOF'
+#!/usr/bin/env python3
+import json
+import os
+import platform
+import pwd
+import subprocess
+import sys
+from pathlib import Path
+from contextlib import contextmanager
+
+FACEAUTH_LINE = "auth sufficient pam_exec.so quiet /usr/local/bin/faceauth"
+
+def run(cmd):
+    try:
+        p = subprocess.run(cmd, text=True, capture_output=True)
+        return p.returncode, p.stdout.strip(), p.stderr.strip()
+    except Exception as e:
+        return 1, "", str(e)
+
+def current_user():
+    return os.environ.get("SUDO_USER") or os.environ.get("USER") or pwd.getpwuid(os.getuid()).pw_name
+
+def user_home(username):
+    return Path(pwd.getpwnam(username).pw_dir)
+
+def header(title):
+    print("")
+    print("=" * 48)
+    print(title)
+    print("=" * 48)
+
+def service_value(args):
+    code, out, err = run(["systemctl"] + args + ["faceauth"])
+    return out if out else err if err else "unknown"
+
+def cmd_status():
+    username = current_user()
+    home = user_home(username)
+    cfg = home / ".faceauth" / "config.json"
+    face = home / ".faceauth" / "my_face.jpg"
+
+    header("FaceAuth Status")
+    print(f"User: {username}")
+    print(f"Service active: {service_value(['is-active'])}")
+    print(f"Service enabled: {service_value(['is-enabled'])}")
+    print(f"Config: {'OK' if cfg.exists() else 'missing'} ({cfg})")
+    print(f"Registered face: {'OK' if face.exists() else 'missing'} ({face})")
+
+    if cfg.exists():
+        try:
+            data = json.loads(cfg.read_text())
+            print(f"Camera index: {data.get('ir_camera')}")
+            print(f"Tolerance: {data.get('tolerance')}")
+            print(f"Desktop: {data.get('desktop')}")
+        except Exception as e:
+            print(f"Config read error: {e}")
+
+def cmd_logs():
+    since = "20 minutes ago"
+    args = sys.argv[2:]
+    if args:
+        since = " ".join(args)
+
+    subprocess.run([
+        "journalctl",
+        "-u", "faceauth",
+        "--since", since,
+        "-l",
+        "--no-pager"
+    ])
+
+def detect_package_manager():
+    for pm in ["dnf", "apt", "pacman", "zypper"]:
+        code, out, err = run(["bash", "-lc", f"command -v {pm}"])
+        if code == 0:
+            return pm
+    return "unknown"
+
+def read_os_release():
+    path = Path("/etc/os-release")
+    if not path.exists():
+        return "unknown"
+
+    data = {}
+    for line in path.read_text(errors="ignore").splitlines():
+        if "=" in line:
+            k, v = line.split("=", 1)
+            data[k] = v.strip('"')
+
+    return data.get("PRETTY_NAME", "unknown")
+
+def import_check(module):
+    code, out, err = run(["python3", "-c", f"import {module}; print('OK')"])
+    return "OK" if code == 0 else f"FAILED: {err or out}"
+
+def pam_check():
+    files = [
+        "/etc/pam.d/gdm-password",
+        "/etc/pam.d/sddm",
+        "/etc/pam.d/lightdm",
+    ]
+
+    for f in files:
+        path = Path(f)
+        if not path.exists():
+            print(f"{f}: missing")
+            continue
+
+        try:
+            text = path.read_text(errors="ignore")
+            print(f"{f}: {'FaceAuth configured' if FACEAUTH_LINE in text else 'no FaceAuth line'}")
+        except Exception as e:
+            print(f"{f}: cannot read ({e})")
+
+@contextmanager
+def suppress_native_stderr():
+    devnull_fd = os.open(os.devnull, os.O_WRONLY)
+    old_stderr_fd = os.dup(2)
+
+    try:
+        os.dup2(devnull_fd, 2)
+        yield
+    finally:
+        os.dup2(old_stderr_fd, 2)
+        os.close(old_stderr_fd)
+        os.close(devnull_fd)
+
+def cmd_list_cameras():
+    header("FaceAuth Camera List")
+
+    try:
+        import cv2
+        import numpy as np
+    except Exception as e:
+        print(f"OpenCV import failed: {e}")
+        return 1
+
+    found = False
+
+    for i in range(10):
+        with suppress_native_stderr():
+            cap = cv2.VideoCapture(i)
+
+        if not cap.isOpened():
+            with suppress_native_stderr():
+                cap.release()
+            continue
+
+        frame = None
+
+        for _ in range(8):
+            with suppress_native_stderr():
+                ret, f = cap.read()
+            if ret and f is not None and f.size > 0 and float(f.mean()) > 1:
+                frame = f
+                break
+
+        with suppress_native_stderr():
+            cap.release()
+
+        if frame is None:
+            print(f"Camera {i}: opens but no usable frame")
+            found = True
+            continue
+
+        if len(frame.shape) == 2:
+            diff = 0
+            brightness = float(frame.mean())
+        else:
+            b, g, r = cv2.split(frame)
+            diff = int(np.mean(np.abs(b.astype(int) - r.astype(int))))
+            brightness = float(frame.mean())
+
+        kind = "ir-like" if diff <= 2 else "rgb"
+        print(f"Camera {i}: OK | type={kind} | color-diff={diff} | brightness={brightness:.2f}")
+        found = True
+
+    if not found:
+        print("No usable cameras found.")
+
+def cmd_doctor():
+    username = current_user()
+
+    header("FaceAuth Doctor Report")
+    print(f"User: {username}")
+    print(f"UID: {pwd.getpwnam(username).pw_uid}")
+    print(f"OS: {read_os_release()}")
+    print(f"Kernel: {platform.release()}")
+    print(f"Package manager: {detect_package_manager()}")
+    print(f"Desktop: {os.environ.get('XDG_CURRENT_DESKTOP', 'unknown')}")
+    print(f"Session type: {os.environ.get('XDG_SESSION_TYPE', 'unknown')}")
+
+    code, out, err = run(["systemctl", "status", "display-manager", "--no-pager"])
+    first = out.splitlines()[0] if out else err.splitlines()[0] if err else "unknown"
+    print(f"Display manager: {first}")
+
+    print("")
+    print("Service:")
+    print(f"  active: {service_value(['is-active'])}")
+    print(f"  enabled: {service_value(['is-enabled'])}")
+
+    print("")
+    print("Python imports:")
+    for m in ["pkg_resources", "cv2", "dlib", "face_recognition_models", "face_recognition"]:
+        print(f"  {m}: {import_check(m)}")
+
+    print("")
+    print("PAM:")
+    pam_check()
+
+    print("")
+    print("Installed files:")
+    for f in ["/usr/local/bin/faceauth", "/usr/local/bin/faceauth_daemon", "/usr/local/bin/faceauthctl", "/etc/systemd/system/faceauth.service"]:
+        print(f"  {f}: {'OK' if Path(f).exists() else 'missing'}")
+
+    print("")
+    cmd_list_cameras()
+
+def usage():
+    print("FaceAuth control tool")
+    print("")
+    print("Usage:")
+    print("  faceauthctl status")
+    print("  faceauthctl logs [since]")
+    print("  faceauthctl doctor")
+    print("  faceauthctl list-cameras")
+    print("")
+    print("Examples:")
+    print("  faceauthctl logs '10 minutes ago'")
+    print("  faceauthctl doctor")
+
+def main():
+    if len(sys.argv) < 2:
+        usage()
+        return 0
+
+    cmd = sys.argv[1]
+
+    if cmd == "status":
+        cmd_status()
+    elif cmd == "logs":
+        cmd_logs()
+    elif cmd == "doctor":
+        cmd_doctor()
+    elif cmd in ("list-cameras", "cameras"):
+        cmd_list_cameras()
+    elif cmd in ("help", "-h", "--help"):
+        usage()
+    else:
+        print(f"Unknown command: {cmd}")
+        usage()
+        return 1
+
+    return 0
+
+if __name__ == "__main__":
+    sys.exit(main())
+CTL_EOF
+
+sudo chmod +x /usr/local/bin/faceauthctl
 
 # Install systemd service
 step "Installing systemd service"
