@@ -1,0 +1,6 @@
+*.log
+*.before-*
+*.backup
+__pycache__/
+*.pyc
+.faceauth/
