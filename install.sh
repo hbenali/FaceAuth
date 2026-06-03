@@ -6,6 +6,12 @@ echo "========================================"
 
 USERNAME=$(whoami)
 USER_ID=$(id -u)
+FORCE_ENROLL=0
+
+if [ "$1" = "--force-enroll" ] || [ "$1" = "--re-enroll" ]; then
+    FORCE_ENROLL=1
+fi
+
 echo "Installing for user: $USERNAME (UID: $USER_ID)"
 
 # Helper functions
@@ -395,7 +401,7 @@ mkdir -p "$FACEAUTH_HOME"
 chmod 700 "$FACEAUTH_HOME"
 
 # Save config
-export FACEAUTH_HOME IR_INDEX DE
+export FACEAUTH_HOME IR_INDEX DE FORCE_ENROLL
 python3 - <<'PYCFG'
 import json
 import os
@@ -417,17 +423,62 @@ print("Config saved!")
 PYCFG
 
 # Capture face
-step "Capturing registered face"
-echo "========================================"
-echo "FACE REGISTRATION"
-echo "Look directly at the selected camera."
-echo "Capturing in 3 seconds..."
-echo "========================================"
+step "Checking face enrollment"
 
 CAPTURE_LOG="/tmp/faceauth_capture.log"
 FACE_IMAGE="$FACEAUTH_HOME/my_face.jpg"
 
-export IR_INDEX FACE_IMAGE
+export IR_INDEX FACE_IMAGE FORCE_ENROLL
+
+SKIP_CAPTURE=0
+
+if [ "$FORCE_ENROLL" != "1" ] && [ -s "$FACE_IMAGE" ]; then
+    log "Existing face enrollment found"
+
+    if python3 - <<'PYCHECK'
+import os
+import sys
+import warnings
+
+warnings.filterwarnings(
+    "ignore",
+    message="pkg_resources is deprecated as an API.*",
+    category=UserWarning,
+)
+
+import face_recognition
+
+face_image = os.environ["FACE_IMAGE"]
+
+try:
+    image = face_recognition.load_image_file(face_image)
+    encodings = face_recognition.face_encodings(image)
+except Exception as e:
+    print(f"Existing face check failed: {e}")
+    sys.exit(1)
+
+if not encodings:
+    print("Existing face image has no usable face encoding.")
+    sys.exit(1)
+
+print(f"Keeping existing face enrollment. Encodings found: {len(encodings)}")
+PYCHECK
+    then
+        SKIP_CAPTURE=1
+    else
+        warn "Existing face enrollment is invalid. Re-enrolling now."
+    fi
+fi
+
+if [ "$SKIP_CAPTURE" != "1" ]; then
+    echo "========================================"
+    echo "FACE REGISTRATION"
+    if [ "$FORCE_ENROLL" = "1" ]; then
+        echo "Force re-enroll requested."
+    fi
+    echo "Look directly at the selected camera."
+    echo "Capturing in 3 seconds..."
+    echo "========================================"
 
 python3 - <<'PYCAP' 2>"$CAPTURE_LOG"
 import cv2
@@ -484,6 +535,8 @@ fi
 
 chmod 600 "$FACE_IMAGE"
 echo "Face image saved: $FACE_IMAGE"
+
+fi
 
 # Verify face
 step "Verifying registered face"
@@ -1428,4 +1481,8 @@ echo "If it does not work immediately:"
 echo "  1. Check logs: journalctl -u faceauth -e --no-pager"
 echo "  2. Log out and log back in"
 echo "  3. Reboot only as a last fallback"
+echo ""
+echo "To re-register your face later:"
+echo "  faceauthctl enroll"
+echo "  or: bash install.sh --force-enroll"
 echo "========================================"
