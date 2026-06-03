@@ -35,7 +35,7 @@ command_exists() {
     command -v "$1" >/dev/null 2>&1
 }
 
-TOTAL_STEPS=12
+TOTAL_STEPS=13
 CURRENT_STEP=0
 
 step() {
@@ -1397,6 +1397,34 @@ StandardError=journal
 [Install]
 WantedBy=graphical.target
 EOF
+
+# Install sleep/resume hook
+step "Installing sleep/resume recovery hook"
+
+SLEEP_HOOK_DIR="/etc/systemd/system-sleep"
+SLEEP_HOOK_FILE="$SLEEP_HOOK_DIR/faceauth"
+
+sudo mkdir -p "$SLEEP_HOOK_DIR" || die "Could not create systemd sleep hook directory: $SLEEP_HOOK_DIR"
+
+sudo tee "$SLEEP_HOOK_FILE" > /dev/null << EOF
+#!/bin/bash
+
+case "\$1/\$2" in
+    post/*)
+        /usr/bin/systemctl restart faceauth.service >/dev/null 2>&1 || true
+        ;;
+esac
+
+exit 0
+EOF
+
+sudo chmod +x "$SLEEP_HOOK_FILE" || die "Could not make sleep hook executable."
+
+if [ ! -x "$SLEEP_HOOK_FILE" ]; then
+    die "Sleep/resume hook was not installed correctly."
+fi
+
+echo "Sleep/resume recovery hook installed: $SLEEP_HOOK_FILE"
 
 # Setup PAM
 step "Setting up PAM"

@@ -46,9 +46,13 @@ for pam_file in "${PAM_FILES[@]}"; do
     fi
 done
 
+log "Removing sleep/resume hook"
+sudo rm -f /etc/systemd/system-sleep/faceauth
+
 log "Removing FaceAuth binaries"
 sudo rm -f /usr/local/bin/faceauth
 sudo rm -f /usr/local/bin/faceauth_daemon
+sudo rm -f /usr/local/bin/faceauthctl
 
 log "Removing runtime token"
 rm -rf "/run/user/$(id -u)/faceauth" 2>/dev/null || true
