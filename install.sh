@@ -411,6 +411,8 @@ config = {
     "rgb_camera": 0,
     "tolerance": 0.6,
     "max_attempts": 50,
+    "max_scan_seconds": 30,
+    "scan_retry_cooldown_seconds": 20,
     "desktop": os.environ["DE"],
 }
 
@@ -600,6 +602,7 @@ import signal
 import sys
 import subprocess
 import threading
+import select
 from contextlib import contextmanager
 
 @contextmanager
@@ -638,14 +641,18 @@ def load_config(username):
             config = json.load(f)
         ir_index = config["ir_camera"]
         tolerance = config["tolerance"]
+        max_scan_seconds = int(config.get("max_scan_seconds", 30))
+        scan_retry_cooldown_seconds = int(config.get("scan_retry_cooldown_seconds", 20))
     except:
         ir_index = 0
         tolerance = 0.6
+        max_scan_seconds = 30
+        scan_retry_cooldown_seconds = 20
     image = face_recognition.load_image_file(face_path)
     encodings = face_recognition.face_encodings(image)
     if not encodings:
         sys.exit(1)
-    return ir_index, tolerance, encodings[0]
+    return ir_index, tolerance, max_scan_seconds, scan_retry_cooldown_seconds, encodings[0]
 
 def write_token(username):
     token_file = get_token_file()
@@ -671,8 +678,9 @@ def unlock_screen():
     except Exception as e:
         print(f"Unlock error: {e}")
 
-def face_recognition_loop(username, ir_index, tolerance, my_encoding, stop_event):
+def face_recognition_loop(username, ir_index, tolerance, max_scan_seconds, my_encoding, stop_event):
     print(f"Camera activated - looking for face on index {ir_index}")
+    scan_started_at = time.time()
 
     video = None
 
@@ -696,6 +704,13 @@ def face_recognition_loop(username, ir_index, tolerance, my_encoding, stop_event
     match_count = 0
 
     while not stop_event.is_set():
+        elapsed = time.time() - scan_started_at
+
+        if elapsed >= max_scan_seconds:
+            print(f"Face scan timed out after {max_scan_seconds}s - stopping camera")
+            stop_event.set()
+            break
+
         with suppress_native_stderr():
             ret, frame = video.read()
 
@@ -727,11 +742,14 @@ def face_recognition_loop(username, ir_index, tolerance, my_encoding, stop_event
 
 def run_daemon(username):
     print(f"FaceAuth daemon starting for {username}")
-    ir_index, tolerance, my_encoding = load_config(username)
+    ir_index, tolerance, max_scan_seconds, scan_retry_cooldown_seconds, my_encoding = load_config(username)
+
     stop_event = None
     face_thread = None
     lock_time = None
     is_locked_state = False
+    session_awake = False
+    last_scan_end = 0
 
     proc = subprocess.Popen(
         ["gdbus", "monitor", "--system",
@@ -742,24 +760,91 @@ def run_daemon(username):
 
     print("Watching for real lockscreen events...")
 
-    def handle_exit(sig, frame):
+    def cleanup_finished_scan():
+        nonlocal stop_event, face_thread, last_scan_end
+
+        if stop_event and face_thread and not face_thread.is_alive():
+            stop_event = None
+            face_thread = None
+            last_scan_end = time.time()
+            print("Camera scan session ended")
+
+    def start_scan(reason):
+        nonlocal stop_event, face_thread
+
+        cleanup_finished_scan()
+
+        if stop_event is not None:
+            return
+
+        print(reason)
+        stop_event = threading.Event()
+        face_thread = threading.Thread(
+            target=face_recognition_loop,
+            args=(username, ir_index, tolerance, max_scan_seconds, my_encoding, stop_event)
+        )
+        face_thread.daemon = True
+        face_thread.start()
+
+    def stop_scan():
+        nonlocal stop_event, face_thread, last_scan_end
+
         if stop_event:
             stop_event.set()
-        if face_thread and face_thread.is_alive():
-            face_thread.join(timeout=2)
+
+            if face_thread and face_thread.is_alive():
+                face_thread.join(timeout=2)
+
+            stop_event = None
+            face_thread = None
+            last_scan_end = time.time()
+
+    def handle_exit(sig, frame):
+        stop_scan()
         proc.terminate()
         sys.exit(0)
 
     signal.signal(signal.SIGTERM, handle_exit)
     signal.signal(signal.SIGINT, handle_exit)
 
-    for line in proc.stdout:
+    while True:
+        cleanup_finished_scan()
+
+        # If a scan timed out but the lockscreen is still awake, retry after cooldown.
+        if (
+            is_locked_state
+            and session_awake
+            and stop_event is None
+            and face_thread is None
+            and last_scan_end
+            and (time.time() - last_scan_end) >= scan_retry_cooldown_seconds
+        ):
+            start_scan(f"Locked session still awake - retrying face scan after {scan_retry_cooldown_seconds}s cooldown")
+
+        ready, _, _ = select.select([proc.stdout], [], [], 0.5)
+
+        if not ready:
+            continue
+
+        line = proc.stdout.readline()
+
+        if not line:
+            break
+
+        line = line.strip()
+
+        if "'IdleHint': <true>" in line:
+            session_awake = False
+
         if "'LockedHint': <true>" in line:
             is_locked_state = True
+            session_awake = False
             lock_time = time.time()
+            last_scan_end = 0
             print("Lock signal received - monitoring...")
 
         elif "'IdleHint': <false>" in line and is_locked_state:
+            session_awake = True
             elapsed = time.time() - lock_time if lock_time else 0
 
             if stop_event is not None:
@@ -770,16 +855,11 @@ def run_daemon(username):
             if elapsed < 1:
                 print("Quick wake - just screen dim, ignoring")
                 is_locked_state = False
+                session_awake = False
                 lock_time = None
+                last_scan_end = 0
             else:
-                print("Real lockscreen - starting camera!")
-                stop_event = threading.Event()
-                face_thread = threading.Thread(
-                    target=face_recognition_loop,
-                    args=(username, ir_index, tolerance, my_encoding, stop_event)
-                )
-                face_thread.daemon = True
-                face_thread.start()
+                start_scan("Real lockscreen - starting camera!")
 
         elif "'LockedHint': <false>" in line or "Session.Unlock" in line:
             if not is_locked_state and stop_event is None:
@@ -787,16 +867,10 @@ def run_daemon(username):
 
             print("Screen UNLOCKED - stopping camera")
             is_locked_state = False
+            session_awake = False
             lock_time = None
-
-            if stop_event:
-                stop_event.set()
-
-                if face_thread and face_thread.is_alive():
-                    face_thread.join(timeout=2)
-
-                stop_event = None
-                face_thread = None
+            last_scan_end = 0
+            stop_scan()
 
 if __name__ == "__main__":
     username = sys.argv[1] if len(sys.argv) > 1 else "FACEAUTH_USER"
@@ -927,6 +1001,8 @@ def cmd_status():
             data = json.loads(cfg.read_text())
             print(f"Camera index: {data.get('ir_camera')}")
             print(f"Tolerance: {data.get('tolerance')}")
+            print(f"Max scan seconds: {data.get('max_scan_seconds', 30)}")
+            print(f"Scan retry cooldown seconds: {data.get('scan_retry_cooldown_seconds', 20)}")
             print(f"Desktop: {data.get('desktop')}")
         except Exception as e:
             print(f"Config read error: {e}")
