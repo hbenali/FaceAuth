@@ -62,6 +62,7 @@ def cmd_status():
             print(f"Max scan seconds: {data.get('max_scan_seconds', 30)}")
             print(f"Scan retry cooldown seconds: {data.get('scan_retry_cooldown_seconds', 20)}")
             print(f"Desktop: {data.get('desktop')}")
+            print(f"Display manager: {data.get('display_manager', 'unknown')}")
         except Exception as e:
             print(f"Config read error: {e}")
 
@@ -107,13 +108,14 @@ def pam_check():
     files = [
         "/etc/pam.d/gdm-password",
         "/etc/pam.d/sddm",
+        "/etc/pam.d/kde",
+        "/etc/pam.d/kscreenlocker",
         "/etc/pam.d/lightdm",
     ]
 
     for f in files:
         path = Path(f)
         if not path.exists():
-            print(f"{f}: missing")
             continue
 
         try:
@@ -188,6 +190,16 @@ def cmd_list_cameras():
     if not found:
         print("No usable cameras found.")
 
+def detect_display_manager():
+    """Return the active display manager service name (sddm/gdm/lightdm/...) or ''."""
+    for candidate in ("sddm", "gdm", "gdm3", "lightdm", "lxdm", "plasmalogin"):
+        code, _, _ = run(["systemctl", "is-active", "--quiet", candidate])
+        if code == 0:
+            return candidate
+    code, out, err = run(["systemctl", "status", "display-manager", "--no-pager"])
+    first = out.splitlines()[0] if out else err.splitlines()[0] if err else ""
+    return first or "unknown"
+
 def cmd_doctor():
     username = current_user()
 
@@ -199,10 +211,7 @@ def cmd_doctor():
     print(f"Package manager: {detect_package_manager()}")
     print(f"Desktop: {os.environ.get('XDG_CURRENT_DESKTOP', 'unknown')}")
     print(f"Session type: {os.environ.get('XDG_SESSION_TYPE', 'unknown')}")
-
-    code, out, err = run(["systemctl", "status", "display-manager", "--no-pager"])
-    first = out.splitlines()[0] if out else err.splitlines()[0] if err else "unknown"
-    print(f"Display manager: {first}")
+    print(f"Display manager: {detect_display_manager()}")
 
     print("")
     print("Service:")

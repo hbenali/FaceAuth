@@ -31,6 +31,8 @@ log "Removing FaceAuth PAM line"
 PAM_FILES=(
     "/etc/pam.d/gdm-password"
     "/etc/pam.d/sddm"
+    "/etc/pam.d/kde"
+    "/etc/pam.d/kscreenlocker"
     "/etc/pam.d/lightdm"
 )
 

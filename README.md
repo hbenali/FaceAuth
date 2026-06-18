@@ -32,12 +32,14 @@ A reboot is usually not required. After installation, lock your screen and test 
 - Ubuntu  
 - Arch Linux
 - Any GNOME based Linux distribution
+- KDE Plasma (with SDDM or plasma-login)
+- Any Linux distribution using GDM or SDDM as the display manager
 
 ## How It Works
 
 FaceAuth runs a lightweight background daemon that monitors for lockscreen events. When the lockscreen wakes, the selected camera activates and scans for your registered face.
 
-Once your face is recognized, FaceAuth writes a short-lived runtime token and sends an unlock signal. The PAM helper verifies the token and allows the unlock.
+Once your face is recognized, FaceAuth writes a short-lived runtime token and sends an unlock signal. The unlock signal targets the screensaver D-Bus interface matching your desktop (`org.gnome.ScreenSaver` on GNOME, `org.freedesktop.ScreenSaver` / `org.kde.screensaver` on KDE Plasma), with `loginctl unlock-sessions` as a fallback. The PAM helper verifies the token and allows the unlock.
 
 If no face is recognized within the configured scan timeout, the camera turns off automatically. If the lockscreen is still awake, FaceAuth waits for a cooldown period and then retries scanning.
 
@@ -84,11 +86,13 @@ Important config options:
 - `tolerance`: face matching strictness
 - `max_scan_seconds`: how long the camera scans before stopping
 - `scan_retry_cooldown_seconds`: how long FaceAuth waits before retrying while the lockscreen is still awake
+- `desktop`: detected desktop (`gnome` or `kde`), used to pick the right unlock signal
+- `display_manager`: detected display manager (`gdm`, `sddm`, ...), used for PAM setup
 
 ## Requirements
 
-- Linux with GNOME desktop
-- GDM recommended for automatic PAM setup
+- Linux with GNOME or KDE Plasma desktop
+- GDM (GNOME) or SDDM or plasma-login (KDE Plasma) recommended for automatic PAM setup
 - Webcam or IR sensor
 - Python 3.8 or higher
 - sudo access for installation
