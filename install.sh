@@ -291,18 +291,78 @@ fi
 
 echo "Dependencies ready!"
 
-# Detect desktop environment
-step "Detecting desktop environment"
-if [ "$XDG_CURRENT_DESKTOP" = "GNOME" ]; then
-    DE="gnome"
-    echo "GNOME detected"
-elif [ "$XDG_CURRENT_DESKTOP" = "KDE" ]; then
-    DE="kde"
-    echo "KDE detected"
-else
-    DE="gnome"
-    echo "Defaulting to GNOME"
+# Detect desktop environment and display manager
+step "Detecting desktop environment and display manager"
+
+# XDG_CURRENT_DESKTOP may be a semicolon-separated list (e.g. "KDE" or "KDE;GNOME").
+# Lowercase it and look for known desktop names.
+XDG_DESKTOP_LC=$(printf '%s' "${XDG_CURRENT_DESKTOP:-}" | tr '[:upper:]' '[:lower:]')
+XDG_SESSION_DESKTOP_LC=$(printf '%s' "${XDG_SESSION_DESKTOP:-}" | tr '[:upper:]' '[:lower:]')
+
+DE="gnome"
+for candidate in "$XDG_DESKTOP_LC" "$XDG_SESSION_DESKTOP_LC"; do
+    [ -z "$candidate" ] && continue
+    if printf '%s' "$candidate" | grep -qE '(^|;)kde($|;)' || printf '%s' "$candidate" | grep -q 'plasma'; then
+        DE="kde"
+        echo "KDE Plasma detected"
+        break
+    fi
+    if printf '%s' "$candidate" | grep -qE '(^|;)gnome($|;)'; then
+        DE="gnome"
+        echo "GNOME detected"
+        break
+    fi
+done
+
+if [ "$DE" = "gnome" ] && [ -n "$XDG_DESKTOP_LC" ] && [ "$XDG_DESKTOP_LC" != "gnome" ]; then
+    echo "Unknown desktop ($XDG_CURRENT_DESKTOP) - defaulting to GNOME-compatible behavior"
 fi
+
+# Display manager detection: check running service, then enabled service,
+# then the display-manager.service symlink target. Fall back to DE hint.
+DM=""
+
+detect_dm() {
+    local candidate base dm_link
+    for candidate in sddm gdm gdm3 lightdm lxdm plasmalogin; do
+        if systemctl is-active --quiet "$candidate" 2>/dev/null; then
+            echo "$candidate"
+            return
+        fi
+    done
+    for candidate in sddm gdm gdm3 lightdm lxdm plasmalogin; do
+        if systemctl is-enabled --quiet "$candidate" 2>/dev/null; then
+            echo "$candidate"
+            return
+        fi
+    done
+    dm_link=$(readlink -f /etc/systemd/system/display-manager.service 2>/dev/null || true)
+    if [ -n "$dm_link" ]; then
+        base=$(basename "$dm_link")
+        case "$base" in
+            sddm.service) echo "sddm"; return ;;
+            gdm.service|gdm3.service) echo "gdm"; return ;;
+            lightdm.service) echo "lightdm"; return ;;
+            lxdm.service) echo "lxdm"; return ;;
+            plasmalogin.service|plasma-login.service) echo "plasmalogin"; return ;;
+        esac
+    fi
+    echo ""
+}
+
+DM=$(detect_dm)
+if [ -z "$DM" ]; then
+    if [ "$DE" = "kde" ]; then
+        DM="sddm"
+        warn "Could not detect display manager. Assuming SDDM for KDE Plasma."
+    else
+        DM="gdm"
+        warn "Could not detect display manager. Assuming GDM for GNOME."
+    fi
+fi
+
+echo "Desktop environment: $DE"
+echo "Display manager: $DM"
 
 # Detect camera - prefer IR-like camera, fallback to RGB
 step "Detecting cameras"
@@ -401,7 +461,7 @@ mkdir -p "$FACEAUTH_HOME"
 chmod 700 "$FACEAUTH_HOME"
 
 # Save config
-export FACEAUTH_HOME IR_INDEX DE FORCE_ENROLL
+export FACEAUTH_HOME IR_INDEX DE DM FORCE_ENROLL
 python3 - <<'PYCFG'
 import json
 import os
@@ -414,6 +474,7 @@ config = {
     "max_scan_seconds": 30,
     "scan_retry_cooldown_seconds": 20,
     "desktop": os.environ["DE"],
+    "display_manager": os.environ.get("DM", ""),
 }
 
 config_path = os.path.join(os.environ["FACEAUTH_HOME"], "config.json")
@@ -643,16 +704,18 @@ def load_config(username):
         tolerance = config["tolerance"]
         max_scan_seconds = int(config.get("max_scan_seconds", 30))
         scan_retry_cooldown_seconds = int(config.get("scan_retry_cooldown_seconds", 20))
+        desktop = str(config.get("desktop", "")).lower()
     except:
         ir_index = 0
         tolerance = 0.6
         max_scan_seconds = 30
         scan_retry_cooldown_seconds = 20
+        desktop = ""
     image = face_recognition.load_image_file(face_path)
     encodings = face_recognition.face_encodings(image)
     if not encodings:
         sys.exit(1)
-    return ir_index, tolerance, max_scan_seconds, scan_retry_cooldown_seconds, encodings[0]
+    return ir_index, tolerance, max_scan_seconds, scan_retry_cooldown_seconds, encodings[0], desktop
 
 def write_token(username):
     token_file = get_token_file()
@@ -664,21 +727,60 @@ def write_token(username):
 
     os.chmod(token_file, 0o600)
 
-def unlock_screen():
+def _try_dbus_unlock(dest, obj_path, method):
     try:
-        subprocess.run(
+        p = subprocess.run(
             ["gdbus", "call", "--session",
-             "--dest", "org.gnome.ScreenSaver",
-             "--object-path", "/org/gnome/ScreenSaver",
-             "--method", "org.gnome.ScreenSaver.SetActive",
+             "--dest", dest,
+             "--object-path", obj_path,
+             "--method", method,
              "false"],
-            capture_output=True, text=True
+            capture_output=True, text=True, timeout=5
         )
-        print("Unlock signal sent!")
+        return p.returncode == 0
+    except Exception:
+        return False
+
+def unlock_screen(desktop=""):
+    """
+    Send an unlock signal. Tries the screensaver D-Bus interfaces that match the
+    active desktop first, then falls back to the XDG standard, then to logind.
+
+    Works with GNOME (gnome-shell), KDE Plasma (ksmserver/kscreenlocker), and
+    any desktop that implements org.freedesktop.ScreenSaver.
+    """
+    desktop = (desktop or os.environ.get("XDG_CURRENT_DESKTOP", "")).lower()
+    is_kde = "kde" in desktop or "plasma" in desktop
+
+    if is_kde:
+        methods = [
+            ("org.freedesktop.ScreenSaver", "/ScreenSaver", "org.freedesktop.ScreenSaver.SetActive"),
+            ("org.freedesktop.ScreenSaver", "/org/freedesktop/ScreenSaver", "org.freedesktop.ScreenSaver.SetActive"),
+            ("org.kde.screensaver", "/ScreenSaver", "org.kde.screensaver.SetActive"),
+            ("org.kde.screensaver", "/org/freedesktop/ScreenSaver", "org.kde.screensaver.SetActive"),
+            ("org.gnome.ScreenSaver", "/org/gnome/ScreenSaver", "org.gnome.ScreenSaver.SetActive"),
+        ]
+    else:
+        methods = [
+            ("org.gnome.ScreenSaver", "/org/gnome/ScreenSaver", "org.gnome.ScreenSaver.SetActive"),
+            ("org.freedesktop.ScreenSaver", "/org/freedesktop/ScreenSaver", "org.freedesktop.ScreenSaver.SetActive"),
+            ("org.freedesktop.ScreenSaver", "/ScreenSaver", "org.freedesktop.ScreenSaver.SetActive"),
+            ("org.kde.screensaver", "/ScreenSaver", "org.kde.screensaver.SetActive"),
+        ]
+
+    for dest, obj_path, method in methods:
+        if _try_dbus_unlock(dest, obj_path, method):
+            print(f"Unlock signal sent via {dest}!")
+            return
+
+    try:
+        subprocess.run(["loginctl", "unlock-sessions"],
+                       capture_output=True, text=True, timeout=5)
+        print("Unlock signal sent via loginctl!")
     except Exception as e:
         print(f"Unlock error: {e}")
 
-def face_recognition_loop(username, ir_index, tolerance, max_scan_seconds, my_encoding, stop_event):
+def face_recognition_loop(username, ir_index, tolerance, max_scan_seconds, my_encoding, stop_event, desktop=""):
     print(f"Camera activated - looking for face on index {ir_index}")
     scan_started_at = time.time()
 
@@ -731,8 +833,9 @@ def face_recognition_loop(username, ir_index, tolerance, max_scan_seconds, my_en
                 if match_count >= 3:
                     print("Face recognized! Unlocking...")
                     write_token(username)
-                    unlock_screen()
-                    match_count = 0
+                    unlock_screen(desktop)
+                    stop_event.set()
+                    break
             else:
                 match_count = max(0, match_count - 1)
         time.sleep(0.1)
@@ -742,7 +845,11 @@ def face_recognition_loop(username, ir_index, tolerance, max_scan_seconds, my_en
 
 def run_daemon(username):
     print(f"FaceAuth daemon starting for {username}")
-    ir_index, tolerance, max_scan_seconds, scan_retry_cooldown_seconds, my_encoding = load_config(username)
+    ir_index, tolerance, max_scan_seconds, scan_retry_cooldown_seconds, my_encoding, desktop = load_config(username)
+
+    is_kde = "kde" in desktop or "plasma" in desktop
+    if is_kde:
+        print("KDE Plasma detected - lock events will trigger scan immediately")
 
     stop_event = None
     face_thread = None
@@ -781,7 +888,7 @@ def run_daemon(username):
         stop_event = threading.Event()
         face_thread = threading.Thread(
             target=face_recognition_loop,
-            args=(username, ir_index, tolerance, max_scan_seconds, my_encoding, stop_event)
+            args=(username, ir_index, tolerance, max_scan_seconds, my_encoding, stop_event, desktop)
         )
         face_thread.daemon = True
         face_thread.start()
@@ -838,10 +945,23 @@ def run_daemon(username):
 
         if "'LockedHint': <true>" in line:
             is_locked_state = True
-            session_awake = False
             lock_time = time.time()
             last_scan_end = 0
-            print("Lock signal received - monitoring...")
+
+            if is_kde:
+                # KDE's screen locker (kscreenlocker) is immediately interactive
+                # when LockedHint is set, and does not toggle IdleHint the way
+                # GNOME does. Start scanning right away instead of waiting for a
+                # wake event that never arrives.
+                session_awake = True
+                print("Lock signal received - starting camera (KDE)...")
+                if stop_event is None:
+                    start_scan("KDE lockscreen - starting camera!")
+                else:
+                    print("Scan already running - monitoring...")
+            else:
+                session_awake = False
+                print("Lock signal received - monitoring...")
 
         elif "'IdleHint': <false>" in line and is_locked_state:
             session_awake = True
@@ -1004,6 +1124,7 @@ def cmd_status():
             print(f"Max scan seconds: {data.get('max_scan_seconds', 30)}")
             print(f"Scan retry cooldown seconds: {data.get('scan_retry_cooldown_seconds', 20)}")
             print(f"Desktop: {data.get('desktop')}")
+            print(f"Display manager: {data.get('display_manager', 'unknown')}")
         except Exception as e:
             print(f"Config read error: {e}")
 
@@ -1049,13 +1170,14 @@ def pam_check():
     files = [
         "/etc/pam.d/gdm-password",
         "/etc/pam.d/sddm",
+        "/etc/pam.d/kde",
+        "/etc/pam.d/kscreenlocker",
         "/etc/pam.d/lightdm",
     ]
 
     for f in files:
         path = Path(f)
         if not path.exists():
-            print(f"{f}: missing")
             continue
 
         try:
@@ -1130,6 +1252,16 @@ def cmd_list_cameras():
     if not found:
         print("No usable cameras found.")
 
+def detect_display_manager():
+    """Return the active display manager service name (sddm/gdm/lightdm/...) or ''."""
+    for candidate in ("sddm", "gdm", "gdm3", "lightdm", "lxdm", "plasmalogin"):
+        code, _, _ = run(["systemctl", "is-active", "--quiet", candidate])
+        if code == 0:
+            return candidate
+    code, out, err = run(["systemctl", "status", "display-manager", "--no-pager"])
+    first = out.splitlines()[0] if out else err.splitlines()[0] if err else ""
+    return first or "unknown"
+
 def cmd_doctor():
     username = current_user()
 
@@ -1141,10 +1273,7 @@ def cmd_doctor():
     print(f"Package manager: {detect_package_manager()}")
     print(f"Desktop: {os.environ.get('XDG_CURRENT_DESKTOP', 'unknown')}")
     print(f"Session type: {os.environ.get('XDG_SESSION_TYPE', 'unknown')}")
-
-    code, out, err = run(["systemctl", "status", "display-manager", "--no-pager"])
-    first = out.splitlines()[0] if out else err.splitlines()[0] if err else "unknown"
-    print(f"Display manager: {first}")
+    print(f"Display manager: {detect_display_manager()}")
 
     print("")
     print("Service:")
@@ -1505,64 +1634,121 @@ echo "Sleep/resume recovery hook installed: $SLEEP_HOOK_FILE"
 # Setup PAM
 step "Setting up PAM"
 
-PAM_FILE=""
-PAM_CHANGED=0
+PAM_LINE="auth sufficient pam_exec.so quiet /usr/local/bin/faceauth"
 
-if [ "$DE" = "gnome" ]; then
-    PAM_FILE="/etc/pam.d/gdm-password"
+# Build list of PAM files to configure based on detected DE/DM.
+# Each entry is "description:path". Multiple files may be configured
+# (e.g. KDE Plasma uses both a screen-locker stack and SDDM for login).
+PAM_TARGETS=()
+
+if [ "$DE" = "kde" ]; then
+    # KDE Plasma screen locker (kscreenlocker_greet) authenticates against the
+    # "kde" PAM stack on most distros; some use a dedicated "kscreenlocker" stack.
+    if [ -f /etc/pam.d/kscreenlocker ]; then
+        PAM_TARGETS+=("KDE screen locker:/etc/pam.d/kscreenlocker")
+    fi
+    if [ -f /etc/pam.d/kde ]; then
+        PAM_TARGETS+=("KDE screen locker:/etc/pam.d/kde")
+    fi
+    # SDDM login screen (boot/reboot login).
+    if [ -f /etc/pam.d/sddm ]; then
+        PAM_TARGETS+=("SDDM login:/etc/pam.d/sddm")
+    fi
 else
-    warn "Automatic PAM setup currently supports GNOME/GDM only."
-    warn "Skipping PAM modification for this desktop environment."
+    # GNOME / GDM
+    if [ -f /etc/pam.d/gdm-password ]; then
+        PAM_TARGETS+=("GDM password login:/etc/pam.d/gdm-password")
+    fi
 fi
 
-if [ -n "$PAM_FILE" ]; then
-    if [ ! -f "$PAM_FILE" ]; then
-        die "PAM file not found: $PAM_FILE"
+# LightDM fallback when GNOME DE was not positively detected.
+if [ "$DM" = "lightdm" ] && [ "$DE" != "kde" ] && [ -f /etc/pam.d/lightdm ]; then
+    PAM_TARGETS+=("LightDM login:/etc/pam.d/lightdm")
+fi
+
+if [ ${#PAM_TARGETS[@]} -eq 0 ]; then
+    warn "No supported PAM file was found for DE=$DE DM=$DM."
+    warn "Skipping automatic PAM modification."
+    warn "Manually add this line near the top of your login/lockscreen PAM stack:"
+    warn "  $PAM_LINE"
+fi
+
+# Track backups and changed files for safe rollback on later failures.
+declare -a PAM_CHANGED_FILES
+declare -a PAM_BACKUPS
+PAM_CHANGED_COUNT=0
+
+restore_all_pam_backups() {
+    local i
+    for i in "${!PAM_CHANGED_FILES[@]}"; do
+        sudo cp "${PAM_BACKUPS[$i]}" "${PAM_CHANGED_FILES[$i]}" 2>/dev/null || true
+    done
+}
+
+configure_pam_file() {
+    local label="$1"
+    local pam_file="$2"
+    local backup
+
+    if [ ! -f "$pam_file" ]; then
+        warn "$label: PAM file not found at $pam_file - skipping."
+        return 0
     fi
 
-    PAM_BACKUP="${PAM_FILE}.faceauth-backup-$(date +%Y%m%d-%H%M%S)"
-    sudo cp "$PAM_FILE" "$PAM_BACKUP"
-    echo "PAM backup created: $PAM_BACKUP"
+    backup="${pam_file}.faceauth-backup-$(date +%Y%m%d-%H%M%S)"
+    sudo cp "$pam_file" "$backup"
+    echo "$label: backup created: $backup"
 
-    PAM_LINE="auth sufficient pam_exec.so quiet /usr/local/bin/faceauth"
-
-    if sudo grep -Fxq "$PAM_LINE" "$PAM_FILE"; then
-        echo "PAM already configured."
-    else
-        sudo sed -i "1i$PAM_LINE" "$PAM_FILE"
-
-        if sudo grep -Fxq "$PAM_LINE" "$PAM_FILE"; then
-            PAM_CHANGED=1
-            echo "PAM configured successfully."
-        else
-            sudo cp "$PAM_BACKUP" "$PAM_FILE"
-            die "PAM modification failed. Backup restored."
-        fi
+    if sudo grep -Fxq "$PAM_LINE" "$pam_file"; then
+        echo "$label: PAM already configured."
+        return 0
     fi
+
+    sudo sed -i "1i$PAM_LINE" "$pam_file"
+
+    if sudo grep -Fxq "$PAM_LINE" "$pam_file"; then
+        PAM_CHANGED_FILES+=("$pam_file")
+        PAM_BACKUPS+=("$backup")
+        PAM_CHANGED_COUNT=$((PAM_CHANGED_COUNT + 1))
+        echo "$label: PAM configured successfully."
+        return 0
+    fi
+
+    sudo cp "$backup" "$pam_file"
+    warn "$label: PAM modification failed. Backup restored."
+    return 1
+}
+
+FAILED_PAM=0
+for target in "${PAM_TARGETS[@]}"; do
+    label="${target%%:*}"
+    path="${target#*:}"
+    if ! configure_pam_file "$label" "$path"; then
+        FAILED_PAM=1
+    fi
+done
+
+if [ "$FAILED_PAM" = "1" ] && [ "$PAM_CHANGED_COUNT" -gt 0 ]; then
+    warn "One or more PAM files could not be configured. Files that succeeded were left in place."
+    warn "Backups are next to the original files with a .faceauth-backup-* suffix."
 fi
 
 # Enable and start service only after PAM setup has succeeded/skipped safely
 step "Starting FaceAuth service"
 
 if ! sudo systemctl daemon-reload; then
-    if [ "$PAM_CHANGED" = "1" ] && [ -n "$PAM_BACKUP" ]; then
-        sudo cp "$PAM_BACKUP" "$PAM_FILE"
-    fi
+    restore_all_pam_backups
     die "systemd daemon-reload failed."
 fi
 
 if ! sudo systemctl enable faceauth; then
-    if [ "$PAM_CHANGED" = "1" ] && [ -n "$PAM_BACKUP" ]; then
-        sudo cp "$PAM_BACKUP" "$PAM_FILE"
-    fi
+    restore_all_pam_backups
     die "Could not enable FaceAuth systemd service."
 fi
 
 if ! sudo systemctl restart faceauth; then
-    if [ "$PAM_CHANGED" = "1" ] && [ -n "$PAM_BACKUP" ]; then
-        sudo cp "$PAM_BACKUP" "$PAM_FILE"
-    fi
-    die "Could not start FaceAuth systemd service. PAM backup restored if FaceAuth changed it."
+    restore_all_pam_backups
+    die "Could not start FaceAuth systemd service. PAM backups restored if FaceAuth changed them."
 fi
 
 sleep 2

@@ -57,16 +57,18 @@ def load_config(username):
         tolerance = config["tolerance"]
         max_scan_seconds = int(config.get("max_scan_seconds", 30))
         scan_retry_cooldown_seconds = int(config.get("scan_retry_cooldown_seconds", 20))
+        desktop = str(config.get("desktop", "")).lower()
     except:
         ir_index = 0
         tolerance = 0.6
         max_scan_seconds = 30
         scan_retry_cooldown_seconds = 20
+        desktop = ""
     image = face_recognition.load_image_file(face_path)
     encodings = face_recognition.face_encodings(image)
     if not encodings:
         sys.exit(1)
-    return ir_index, tolerance, max_scan_seconds, scan_retry_cooldown_seconds, encodings[0]
+    return ir_index, tolerance, max_scan_seconds, scan_retry_cooldown_seconds, encodings[0], desktop
 
 def write_token(username):
     token_file = get_token_file()
@@ -78,21 +80,60 @@ def write_token(username):
 
     os.chmod(token_file, 0o600)
 
-def unlock_screen():
+def _try_dbus_unlock(dest, obj_path, method):
     try:
-        subprocess.run(
+        p = subprocess.run(
             ["gdbus", "call", "--session",
-             "--dest", "org.gnome.ScreenSaver",
-             "--object-path", "/org/gnome/ScreenSaver",
-             "--method", "org.gnome.ScreenSaver.SetActive",
+             "--dest", dest,
+             "--object-path", obj_path,
+             "--method", method,
              "false"],
-            capture_output=True, text=True
+            capture_output=True, text=True, timeout=5
         )
-        print("Unlock signal sent!")
+        return p.returncode == 0
+    except Exception:
+        return False
+
+def unlock_screen(desktop=""):
+    """
+    Send an unlock signal. Tries the screensaver D-Bus interfaces that match the
+    active desktop first, then falls back to the XDG standard, then to logind.
+
+    Works with GNOME (gnome-shell), KDE Plasma (ksmserver/kscreenlocker), and
+    any desktop that implements org.freedesktop.ScreenSaver.
+    """
+    desktop = (desktop or os.environ.get("XDG_CURRENT_DESKTOP", "")).lower()
+    is_kde = "kde" in desktop or "plasma" in desktop
+
+    if is_kde:
+        methods = [
+            ("org.freedesktop.ScreenSaver", "/ScreenSaver", "org.freedesktop.ScreenSaver.SetActive"),
+            ("org.freedesktop.ScreenSaver", "/org/freedesktop/ScreenSaver", "org.freedesktop.ScreenSaver.SetActive"),
+            ("org.kde.screensaver", "/ScreenSaver", "org.kde.screensaver.SetActive"),
+            ("org.kde.screensaver", "/org/freedesktop/ScreenSaver", "org.kde.screensaver.SetActive"),
+            ("org.gnome.ScreenSaver", "/org/gnome/ScreenSaver", "org.gnome.ScreenSaver.SetActive"),
+        ]
+    else:
+        methods = [
+            ("org.gnome.ScreenSaver", "/org/gnome/ScreenSaver", "org.gnome.ScreenSaver.SetActive"),
+            ("org.freedesktop.ScreenSaver", "/org/freedesktop/ScreenSaver", "org.freedesktop.ScreenSaver.SetActive"),
+            ("org.freedesktop.ScreenSaver", "/ScreenSaver", "org.freedesktop.ScreenSaver.SetActive"),
+            ("org.kde.screensaver", "/ScreenSaver", "org.kde.screensaver.SetActive"),
+        ]
+
+    for dest, obj_path, method in methods:
+        if _try_dbus_unlock(dest, obj_path, method):
+            print(f"Unlock signal sent via {dest}!")
+            return
+
+    try:
+        subprocess.run(["loginctl", "unlock-sessions"],
+                       capture_output=True, text=True, timeout=5)
+        print("Unlock signal sent via loginctl!")
     except Exception as e:
         print(f"Unlock error: {e}")
 
-def face_recognition_loop(username, ir_index, tolerance, max_scan_seconds, my_encoding, stop_event):
+def face_recognition_loop(username, ir_index, tolerance, max_scan_seconds, my_encoding, stop_event, desktop=""):
     print(f"Camera activated - looking for face on index {ir_index}")
     scan_started_at = time.time()
 
@@ -145,8 +186,9 @@ def face_recognition_loop(username, ir_index, tolerance, max_scan_seconds, my_en
                 if match_count >= 3:
                     print("Face recognized! Unlocking...")
                     write_token(username)
-                    unlock_screen()
-                    match_count = 0
+                    unlock_screen(desktop)
+                    stop_event.set()
+                    break
             else:
                 match_count = max(0, match_count - 1)
         time.sleep(0.1)
@@ -156,7 +198,11 @@ def face_recognition_loop(username, ir_index, tolerance, max_scan_seconds, my_en
 
 def run_daemon(username):
     print(f"FaceAuth daemon starting for {username}")
-    ir_index, tolerance, max_scan_seconds, scan_retry_cooldown_seconds, my_encoding = load_config(username)
+    ir_index, tolerance, max_scan_seconds, scan_retry_cooldown_seconds, my_encoding, desktop = load_config(username)
+
+    is_kde = "kde" in desktop or "plasma" in desktop
+    if is_kde:
+        print("KDE Plasma detected - lock events will trigger scan immediately")
 
     stop_event = None
     face_thread = None
@@ -195,7 +241,7 @@ def run_daemon(username):
         stop_event = threading.Event()
         face_thread = threading.Thread(
             target=face_recognition_loop,
-            args=(username, ir_index, tolerance, max_scan_seconds, my_encoding, stop_event)
+            args=(username, ir_index, tolerance, max_scan_seconds, my_encoding, stop_event, desktop)
         )
         face_thread.daemon = True
         face_thread.start()
@@ -252,10 +298,23 @@ def run_daemon(username):
 
         if "'LockedHint': <true>" in line:
             is_locked_state = True
-            session_awake = False
             lock_time = time.time()
             last_scan_end = 0
-            print("Lock signal received - monitoring...")
+
+            if is_kde:
+                # KDE's screen locker (kscreenlocker) is immediately interactive
+                # when LockedHint is set, and does not toggle IdleHint the way
+                # GNOME does. Start scanning right away instead of waiting for a
+                # wake event that never arrives.
+                session_awake = True
+                print("Lock signal received - starting camera (KDE)...")
+                if stop_event is None:
+                    start_scan("KDE lockscreen - starting camera!")
+                else:
+                    print("Scan already running - monitoring...")
+            else:
+                session_awake = False
+                print("Lock signal received - monitoring...")
 
         elif "'IdleHint': <false>" in line and is_locked_state:
             session_awake = True
